@@ -1,0 +1,43 @@
+require('./register-ts.cjs');
+const {test}=require('node:test');
+const assert=require('node:assert/strict');
+const fs=require('node:fs/promises');
+const path=require('node:path');
+const os=require('node:os');
+const {spawn}=require('node:child_process');
+const {setTimeout:delay}=require('node:timers/promises');
+const {createWorkspaceStore}=require('../src/services/workspace-store.ts');
+const {createOneDriveConnection}=require('../src/services/onedrive/connection.ts');
+
+test('OneDrive HTTP: admin-only setup, CSRF, safe callback and no client-selected local fallback',{timeout:90000},async t=>{
+ const temporary=await fs.mkdtemp(path.join(os.tmpdir(),'onelist-cloud-http-'));
+ const root=path.join(temporary,'files'),directory=path.join(temporary,'private');await fs.mkdir(root);
+ await fs.writeFile(path.join(root,'local-only.txt'),'Do not expose after cloud activation');
+ const store=createWorkspaceStore(directory,{username:'admin',password:'http-cloud-admin-password'});
+ const admin=await store.authenticate('admin','http-cloud-admin-password','test');
+ await store.createUser(admin.user,{username:'member',name:'Member',password:'http-cloud-member-password',role:'user'});
+ const member=await store.authenticate('member','http-cloud-member-password','test');
+ const base='http://127.0.0.1:3018';
+ const headers={cookie:'onelist-session='+admin.token,origin:base};
+ const child=spawn(process.execPath,['node_modules/next/dist/bin/next','start','--hostname','127.0.0.1','--port','3018'],{cwd:path.resolve(__dirname,'..'),windowsHide:true,stdio:['ignore','pipe','pipe'],env:{...process.env,NEXT_DIST_DIR:process.env.NEXT_DIST_DIR||'.next-crm',LOCAL_DRIVE_ROOT:root,LOCAL_DATA_DIR:directory,ADMIN_USERNAME:'admin',ADMIN_PASSWORD:'http-cloud-admin-password',AUTH_URL:base,ONEDRIVE_CLIENT_ID:'',ONEDRIVE_CLIENT_SECRET:'',ONEDRIVE_REDIRECT_URI:base+'/api/admin/onedrive/callback',NEXT_TELEMETRY_DISABLED:'1'}});
+ let logs='';child.stdout.on('data',chunk=>logs+=chunk);child.stderr.on('data',chunk=>logs+=chunk);
+ t.after(async()=>{if(child.exitCode===null){const stopped=new Promise(resolve=>child.once('exit',resolve));child.kill();await stopped;}await fs.rm(temporary,{recursive:true,force:true});});
+ let ready=false;for(let i=0;i<100;i++){try{if((await fetch(base+'/login')).ok){ready=true;break;}}catch{}if(child.exitCode!==null)break;await delay(150);}assert.ok(ready,logs);
+ assert.equal((await fetch(base+'/api/admin/onedrive')).status,401);
+ assert.equal((await fetch(base+'/api/admin/onedrive',{headers:{cookie:'onelist-session='+member.token}})).status,403);
+ const status=await fetch(base+'/api/admin/onedrive',{headers});assert.equal(status.status,200);const initial=await status.json();assert.equal(initial.active,false);assert.equal(initial.configured,false);assert.ok(initial.missing.includes('ONEDRIVE_CLIENT_ID'));
+ assert.equal((await fetch(base+'/api/admin/onedrive/connect',{method:'POST',headers:{...headers,origin:'http://evil.example'}})).status,403);
+ assert.equal((await fetch(base+'/api/admin/onedrive/connect',{method:'POST',headers})).status,503);
+ const callback=await fetch(base+'/api/admin/onedrive/callback?code=never-echo-this-code&state=invalid',{headers,redirect:'manual'});assert.equal(callback.status,303);assert.equal(callback.headers.get('location'),'/admin/storage?error=connection');assert.ok(!(await callback.text()).includes('never-echo'));
+ const local=await fetch(base+'/api/onedrive/list',{headers:{...headers,'x-onedrivelist-storage':'unavailable'}});assert.equal(local.status,200);
+ const client=createOneDriveConnection({directory,clientId:'test-client',clientSecret:'test-secret',redirectUri:base+'/callback',fetch:async url=>{
+  if(String(url).includes('/token'))return Response.json({access_token:'never-public-token',refresh_token:'never-public-refresh',expires_in:3600});
+  if(String(url).endsWith('/me'))return Response.json({id:'owner',displayName:'Owner'});
+  if(String(url).endsWith('/me/drive'))return Response.json({id:'drive'});
+  return Response.json({id:'root',name:'OneDriveList',folder:{}});
+ }});
+ const state=new URL(await client.createAuthorization('admin-session')).searchParams.get('state');await client.completeAuthorization({state,code:'isolated-code',sessionToken:'admin-session'});await client.disconnect();
+ const cloud=await fetch(base+'/api/onedrive/list',{headers:{...headers,'x-onedrivelist-storage':'local'}});assert.equal(cloud.status,503);assert.ok(!(await cloud.text()).includes('local-only'));
+ const final=await (await fetch(base+'/api/admin/onedrive',{headers})).json();assert.equal(final.active,true);assert.equal(final.connected,false);assert.ok(!JSON.stringify(final).includes('never-public'));
+ assert.equal((await fetch(base+'/api/admin/onedrive',{method:'DELETE',headers:{...headers,origin:'http://evil.example'}})).status,403);
+});
